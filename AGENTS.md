@@ -1,0 +1,65 @@
+# AGENTS.md
+
+Guide for AI coding agents (Claude Code, Cursor, Copilot, Aider, ...) and human contributors working in this repo. Read this first for the monorepo-level contract between `apps/client` and `packages/api`; each package has its own `AGENTS.md` for its internal invariants — read that too before touching code inside it.
+
+- Backend rules: [`packages/api/AGENTS.md`](./packages/api/AGENTS.md)
+- Frontend rules: [`apps/client/AGENTS.md`](./apps/client/AGENTS.md)
+
+## Layout
+
+Bun workspaces + Turborepo. Two packages:
+
+- `packages/api` — Elysia + MikroORM (PostgreSQL) + BullMQ (Redis) backend. Owns the database, auth (Better Auth: username/password, bearer tokens), and background jobs.
+- `apps/client` — React + Vite single-page app (client-side rendering only, React Router). Owns the session token in `localStorage`; it's a typed client over `packages/api`.
+
+## The FE/BE contract: Eden Treaty, not a hand-written API client
+
+`packages/api/src/index.ts` exports `export type App = Awaited<ReturnType<typeof main>>`. `apps/client` imports it (`import type { App } from 'api'`, a workspace dependency) and builds its entire API surface from it via `@elysia/eden`'s `treaty<App>(...)` in `apps/client/src/lib/eden-client.ts`. This is the **only** sanctioned way the frontend talks to the backend.
+
+Non-negotiable consequences:
+
+1. **Never hand-write a `fetch`/`axios` call to the API from `apps/client`.** Every request goes through `api.<path>.<method>()` from `lib/eden-client.ts`, wrapped in that file's `unwrap()` helper (Eden never throws on non-2xx; `unwrap` turns `{ data, error }` into throw-or-return so callers can use plain `try/catch`).
+2. **The frontend's types come from a build artifact, not live source.** `packages/api/package.json`'s `"types"` field points at `dist/index.d.ts`, produced by `bun run build` (`tsc --emitDeclarationOnly`) in `packages/api`. `dist/` is gitignored, and Turborepo's `dev` task has **no** `dependsOn: build` — nothing rebuilds it for you. After changing a route path, adding/removing a route, or changing a `model.ts` body/response schema in `packages/api`, run `bun run build` there (or `bunx turbo build --filter=api`) before trusting `apps/client`'s types or before it will pick up the change at all.
+3. **Treat `packages/api` routes/schemas as a public API contract from the frontend's perspective.** A schema change isn't just a backend refactor — it can silently break `apps/client`'s type-checking (stale `dist/` = stale types, not a compile error) or its runtime behavior (missing field, renamed field). When you change a route in `packages/api`, check `apps/client` for callers of that route in the same change.
+4. **Don't duplicate the API contract by hand** — no manually-written request/response TypeScript interfaces in `apps/client` for data that Eden Treaty already types from `App`. If Eden's inferred type is awkward for a specific case, fix the backend's `model.ts` schema rather than working around it with a local hand-rolled type.
+5. **Scoped exception — auth flows use Better Auth's own client, not Eden Treaty.** `apps/client/src/lib/auth-client.ts` is the _only_ sanctioned non-Eden path to the API, and it may only be used for authentication: sign-up, sign-in, sign-out, and session lookup. Better Auth serves `/api/auth/*` from a mounted handler that Elysia never types, so those endpoints cannot appear in `App` and Eden cannot reach them; Everything that is not authentication — including `/api/profile/*` — still goes through `api.<path>.<method>()` in `eden-client.ts`. Do not add a third client, and do not route non-auth calls through `authClient`.
+
+## Auth model (spans both packages)
+
+- `packages/api` owns `/api/auth/*` via [Better Auth](https://better-auth.com), mounted on a `better-auth-mikro-orm` adapter over the same MikroORM pool `packages/api` already uses for everything else — no second database connection. Sign-in method: username + password (sign-up also collects an email). The session is a bearer token: `packages/api` returns it in the `set-auth-token` response header on successful sign-in/sign-up, and `apps/client` stores it in `localStorage`. Every request to authenticated endpoints includes `Authorization: Bearer <token>`. Server-side authorization is `checkAuth(roles)` in `packages/api/src/macros/auth.ts`, which calls `auth.api.getSession({ headers })` per request (a DB-backed session lookup). `role` is a server-owned Better Auth `user.additionalFields` entry (`input: false`): it is never settable from client input on sign-up/sign-in. See `packages/api/AGENTS.md` for backend-side rules.
+- `apps/client` reads the session token from `apps/client/src/lib/auth-token.ts`, which owns the `localStorage` key. The authed layout (`apps/client/src/routes/authed-layout.tsx`) redirects to `/login` when no token is stored, otherwise syncs the session user (`getSessionUser()` → Better Auth's `authClient.getSession()`) into a Zustand store (`apps/client/src/stores/user-store.ts`). See `apps/client/AGENTS.md` for frontend-side rules.
+- **Bearer tokens are not auto-sent by the browser** — CSRF risk is therefore lower than cookies. An attacker's page cannot automatically include a bearer token in requests the way it can with cookies. Better Auth's `trustedOrigins` check (an explicit Origin/Referer allowlist on state-changing requests) provides an additional layer — so `CLIENT_URL` (which feeds `trustedOrigins`) must be the exact production origin, not a wildcard.
+- **One auth mechanism — don't mix.** Bearer tokens (not cookies) are what let the client and API live on different registrable domains. Do not introduce a second auth mechanism (e.g. JWT alongside bearer tokens, cookie sessions, or a social/OAuth provider — a browser-redirect flow can't hand the SPA a response header, so it needs its own token handoff) without updating both packages deliberately — they are not designed to coexist.
+
+## Commands
+
+```sh
+bun install                        # once, from repo root
+bun run dev                        # turbo: runs client + api dev servers
+bun run dev:worker                 # turbo: BullMQ worker (separate process)
+bun run test                       # turbo: tests (api tests need Postgres + Redis)
+bun run build                      # turbo: builds every workspace (needed for api's dist/index.d.ts)
+bun run check-types                # turbo: tsc --noEmit across every workspace
+bun run lint                       # turbo: oxlint across every workspace
+bun run format                     # prettier: format all files (root-only, not via turbo)
+bun run format:check               # prettier: check formatting without writing (root-only, not via turbo)
+bunx turbo dev --filter=client     # single workspace
+bunx turbo build --filter=api      # single workspace — run after backend route/schema changes
+```
+
+## Before shipping (any feature or bugfix, either package)
+
+Run `bun run lint` and `bun run format:check` (or `bun run format` to auto-fix) from repo root, across **both** workspaces, and leave zero errors and zero warnings — not just zero errors. A warning oxlint reports is real signal (dead code, a render hazard, an inconsistent import) even though it doesn't fail the exit code; don't leave it for someone else to triage later.
+
+- If a rule's suggested fix is genuinely correct for the code (the common case — e.g. hoisting a function that closes over nothing, fixing a shadowed variable), fix it.
+- If a rule fires on a pattern that's intentional and correct for its context (e.g. `react/set-state-in-effect` where the setState genuinely must happen inside an effect), suppress that specific line with `// oxlint-disable-next-line <rule>` **plus a comment explaining why it's safe** — never a bare disable, and never a broad file-level or config-level disable to silence something that's only safe in one spot. The disable comment must be the line immediately before the flagged code — a comment between the directive and the code breaks the association silently.
+- Don't leave a warning un-triaged with the excuse that it's "pre-existing" — if you touched the file or the feature you're shipping surfaces it, resolve it (fix or justified suppression) before considering the work done.
+- Also run `bun run check-types` and `bun run build` — a clean lint/format pass doesn't substitute for either.
+
+## Env files
+
+- `packages/api/.env` (from `.env.example`) — `DATABASE_URL`, `BETTER_AUTH_SECRET`, `REDIS_URL` are required at boot (fails fast if missing). `CLIENT_URL` is not boot-required — it defaults to `http://localhost:3001` — but must be set correctly for both credentialed CORS and Better Auth's `trustedOrigins` to work outside that default. See `packages/api/README.md` for the full table.
+- `apps/client/.env` (from `.env.example`) — `VITE_API_URL` (build-time), defaults to `http://localhost:3000` and doubles as the Better Auth client's `baseURL` (`apps/client/src/lib/auth-client.ts`).
+- Root `.env` (from `.env.example`) — used only by `docker compose` for `${VAR}` substitution.
+
+Never commit `.env` files. Adding a new required var to either package: update its `.env.example` with a comment explaining when it's required.

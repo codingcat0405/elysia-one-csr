@@ -1,0 +1,10 @@
+# lockfiles
+package-lock.json
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+
+# build output
+dist
+build
+.turbo
